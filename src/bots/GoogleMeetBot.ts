@@ -1,7 +1,7 @@
-import { JoinParams } from './AbstractMeetBot';
+import { BotReporter, JoinParams, RecordingRules } from './AbstractMeetBot';
 import { BotStatus, WaitPromise } from '../types';
 import config from '../config';
-import { RecordingUploadFailedError, UnsupportedMeetingError, WaitingAtLobbyRetryError } from '../error';
+import { MeetingCancelledError, RecordingUploadFailedError, UnsupportedMeetingError, WaitingAtLobbyRetryError } from '../error';
 import { patchBotStatus } from '../services/botService';
 import { handleUnsupportedMeetingError, handleWaitingAtLobbyError, MeetBotBase } from './MeetBotBase';
 import { v4 } from 'uuid';
@@ -19,6 +19,17 @@ import { getGoogleMeetDisplayName } from '../util/googleMeetDisplayName';
 export class GoogleMeetBot extends MeetBotBase {
   private _logger: Logger;
   private _correlationId: string;
+  private reporter?: BotReporter;
+  private rules?: RecordingRules;
+  private windowSlot = 0;
+  private stopRequested = false;
+  private recordingActive = false;   // the in-page recorder is running
+  private recordingStarted = false;  // ...has run at least once (so there may be data worth saving)
+  private uploadAttempted = false;
+  private endRecordingEarly?: () => void;
+  private leavingOnPurpose = false;
+  /** The browser went away by itself while recording (a crash), as opposed to the meeting ending or stop(). */
+  browserClosedUnexpectedly = false;
   constructor(logger: Logger, correlationId: string) {
     super();
     this.slightlySecretId = v4();
@@ -26,12 +37,61 @@ export class GoogleMeetBot extends MeetBotBase {
     this._correlationId = correlationId;
   }
 
-  async join({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader }: JoinParams): Promise<void> {
-    const _state: BotStatus[] = ['processing'];
+  /**
+   * Ask the bot to leave the meeting. If a recording is running it is stopped, flushed and saved
+   * by the normal join() flow; if the bot is still joining, the attempt is cancelled.
+   */
+  async stop(): Promise<void> {
+    if (this.stopRequested) return;
+    this.stopRequested = true;
+    this._logger.info('Stop requested - leaving the meeting...');
 
-    const handleUpload = async () => {
+    if (this.recordingActive && this.page && !this.page.isClosed()) {
+      try {
+        await this.page.evaluate(() => { (window as any).__meetingBotStop?.(); });
+        // Safety net: if the in-page recorder never reports back, end the wait ourselves
+        setTimeout(() => this.endRecordingEarly?.(), 20000).unref();
+        return;
+      } catch (error) {
+        this._logger.warn('Could not reach the in-page recorder, closing the browser instead', { error });
+        this.endRecordingEarly?.();
+        return;
+      }
+    }
+
+    // Still launching / joining / waiting in the lobby: nothing to save, just close the browser.
+    await this.closeBrowser().catch(() => undefined);
+  }
+
+  private async closeBrowser(): Promise<void> {
+    const context = this.page?.context();
+    if (!context) return;
+    if (isExternalBrowserContext(context)) {
+      await this.page.close();
+    } else {
+      const browser = context.browser();
+      if (browser?.isConnected()) await browser.close();
+      else await context.close();
+    }
+  }
+
+  private throwIfCancelled(): void {
+    if (this.stopRequested) {
+      throw new MeetingCancelledError();
+    }
+  }
+
+  async join({ url, name, bearerToken, teamId, timezone, userId, eventId, botId, uploader, reporter, windowSlot, rules }: JoinParams): Promise<void> {
+    const _state: BotStatus[] = ['processing'];
+    this.reporter = reporter;
+    this.rules = rules;
+    this.windowSlot = windowSlot ?? 0;
+
+    const handleUpload = async (options?: { forceUpload?: boolean }) => {
+      this.uploadAttempted = true;
+      this.reporter?.phase('saving');
       this._logger.info('Begin recording upload to server', { userId, teamId });
-      const uploadResult = await uploader.uploadRecordingToRemoteStorage();
+      const uploadResult = await uploader.uploadRecordingToRemoteStorage(options);
       this._logger.info('Recording upload result', { uploadResult, userId, teamId });
       return uploadResult;
     };
@@ -53,8 +113,17 @@ export class GoogleMeetBot extends MeetBotBase {
       if (!_state.includes('finished') && !_state.includes('failed'))
         _state.push('failed');
 
+      // The recording died half way (browser crashed, window closed...). Keep what was captured.
+      if (this.recordingStarted && !this.uploadAttempted) {
+        try {
+          await handleUpload({ forceUpload: true });
+        } catch (salvageError) {
+          this._logger.warn('Could not save the partial recording', { error: salvageError });
+        }
+      }
+
       await patchBotStatus({ botId, eventId, provider: 'google', status: _state, token: bearerToken }, this._logger);
-      
+
       if (error instanceof WaitingAtLobbyRetryError) {
         await handleWaitingAtLobbyError({ token: bearerToken, botId, eventId, provider: 'google', error }, this._logger);
       }
@@ -88,9 +157,16 @@ export class GoogleMeetBot extends MeetBotBase {
 
   private async joinMeeting({ url, name, teamId, userId, eventId, botId, pushState, uploader }: JoinParams & { pushState(state: BotStatus): void }): Promise<void> {
     this._logger.info('Launching browser...');
+    this.reporter?.phase('launching', 'Starting the browser');
+    this.throwIfCancelled();
 
-    this.page = await createBrowserContext(url, this._correlationId, 'google');
+    this.page = await createBrowserContext(url, this._correlationId, 'google', { windowSlot: this.windowSlot });
+    if (this.stopRequested) {
+      await this.closeBrowser().catch(() => undefined);
+      throw new MeetingCancelledError();
+    }
 
+    this.reporter?.phase('joining', 'Opening the meeting');
     this._logger.info('Navigating to Google Meet URL...');
     await this.page.goto(url, { waitUntil: 'domcontentloaded' });
 
@@ -203,7 +279,8 @@ export class GoogleMeetBot extends MeetBotBase {
           15000,
           async () => {
             await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'text-input-field-wait', userId, this._logger, botId);
-          }
+          },
+          () => this.stopRequested
         );
 
         this._logger.info('Filling the input field with the name...');
@@ -278,7 +355,8 @@ export class GoogleMeetBot extends MeetBotBase {
           15000,
           async () => {
             await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'ask-to-join-button-click', userId, this._logger, botId);
-          }
+          },
+          () => this.stopRequested
         );
 
         // After clicking join, Google Meet may show the camera/mic dialog again.
@@ -298,6 +376,8 @@ export class GoogleMeetBot extends MeetBotBase {
         let redirectedFromMeetBodyText: string | undefined;
         let lobbyRequestTimedOut = false;
 
+        this.reporter?.phase('lobby', 'Waiting to be let into the meeting');
+
         const waitAtLobbyPromise = new Promise<boolean>((resolveWaiting) => {
           waitTimeout = setTimeout(() => {
             clearInterval(waitInterval);
@@ -305,6 +385,12 @@ export class GoogleMeetBot extends MeetBotBase {
           }, wanderingTime);
 
           waitInterval = setInterval(async () => {
+            if (this.stopRequested) {
+              clearInterval(waitInterval);
+              clearTimeout(waitTimeout);
+              resolveWaiting(false);
+              return;
+            }
             try {
               // Keep dismissing the camera/mic dialog if it reappears after clicking join
               await clickContinueWithoutDevicesIfPresent(500).catch(() => {});
@@ -500,6 +586,7 @@ export class GoogleMeetBot extends MeetBotBase {
       });
 
       const waitingAtLobbySuccess = await waitAtLobbyPromise;
+      this.throwIfCancelled();
       if (waitingAtLobbySuccess) {
         joinedMeeting = true;
         break;
@@ -660,9 +747,16 @@ export class GoogleMeetBot extends MeetBotBase {
     { teamId, userId, eventId, botId, uploader }: 
     { teamId: string, userId: string, eventId?: string, botId?: string, uploader: IUploader }
   ): Promise<void> {
-    const duration = config.maxRecordingDuration * 60 * 1000;
+    const rules = this.rules;
+    const duration = (rules?.maxDurationMinutes ?? config.maxRecordingDuration) * 60 * 1000;
     const inactivityLimit = config.inactivityLimit * 60 * 1000;
-    const loneParticipantExitDelayMs = config.loneParticipantExitDelaySeconds * 1000;
+    const loneParticipantExitDelayMs = (rules?.aloneExitSeconds ?? config.loneParticipantExitDelaySeconds) * 1000;
+    const initialAloneGraceMs = (rules?.initialAloneMinutes ?? config.activateInactivityDetectionAfter) * 60 * 1000;
+    const silenceDetectionEnabled = rules?.silenceDetection ?? true;
+    const recorderBitrates = {
+      ...(rules?.videoKbps ? { videoBitsPerSecond: rules.videoKbps * 1000 } : {}),
+      ...(rules?.audioKbps ? { audioBitsPerSecond: rules.audioKbps * 1000 } : {}),
+    };
 
     // Capture and send the browser console logs to Node.js context
     this.page?.on('console', async msg => {
@@ -680,6 +774,11 @@ export class GoogleMeetBot extends MeetBotBase {
       await uploader.saveDataToTempFile(buffer);
     });
 
+    await this.page.exposeFunction('screenAppParticipants', (slightlySecretId: string, count: number) => {
+      if (slightlySecretId !== this.slightlySecretId) return;
+      if (typeof count === 'number') this.reporter?.participants(count);
+    });
+
     await this.page.exposeFunction('screenAppMeetEnd', (slightlySecretId: string, recordedDurationSeconds?: number) => {
       if (slightlySecretId !== this.slightlySecretId) return;
       try {
@@ -693,12 +792,16 @@ export class GoogleMeetBot extends MeetBotBase {
       }
     });
 
-    const { mimeTypes } = getRecordingMimeTypesForExtension(config.uploaderFileExtension);
+    const defaultMimeTypes = getRecordingMimeTypesForExtension(config.uploaderFileExtension).mimeTypes;
+    const mimeTypes = [...(rules?.preferredMimeTypes ?? []), ...defaultMimeTypes];
+    const videoConstraints: boolean | MediaTrackConstraints = rules?.frameRate
+      ? { frameRate: { ideal: rules.frameRate, max: rules.frameRate } }
+      : true;
 
     // Inject the MediaRecorder code into the browser context using page.evaluate
     await this.page.evaluate(
-      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes }:
-      { teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[] }) => {
+      async ({ teamId, duration, inactivityLimit, loneParticipantExitDelayMs, initialAloneGraceMs, silenceDetectionEnabled, recorderBitrates, userId, slightlySecretId, activateInactivityDetectionAfter, activateInactivityDetectionAfterMinutes, mimeTypes, videoConstraints }:
+      { videoConstraints: boolean | MediaTrackConstraints, teamId:string, userId: string, duration: number, inactivityLimit: number, loneParticipantExitDelayMs: number, initialAloneGraceMs: number, silenceDetectionEnabled: boolean, recorderBitrates: { videoBitsPerSecond?: number, audioBitsPerSecond?: number }, slightlySecretId: string, activateInactivityDetectionAfter: string, activateInactivityDetectionAfterMinutes: number, mimeTypes: string[] }) => {
         let timeoutId: NodeJS.Timeout;
         let inactivitySilenceDetectionTimeout: NodeJS.Timeout;
         let isOnValidGoogleMeetPageInterval: NodeJS.Timeout;
@@ -726,7 +829,7 @@ export class GoogleMeetBot extends MeetBotBase {
           }
           
           const stream: MediaStream = await (navigator.mediaDevices as any).getDisplayMedia({
-            video: true,
+            video: videoConstraints,
             audio: {
               autoGainControl: false,
               channels: 2,
@@ -751,7 +854,7 @@ export class GoogleMeetBot extends MeetBotBase {
           }
 
           console.log(`Media Recorder will use ${selectedMimeType} codecs...`);
-          const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMimeType });
+          const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMimeType, ...recorderBitrates });
           console.log(`Media Recorder actual mime type: ${mediaRecorder.mimeType}`);
           let chunkUploadChain: Promise<void> = Promise.resolve();
           let isStoppingRecording = false;
@@ -777,7 +880,6 @@ export class GoogleMeetBot extends MeetBotBase {
           const chunkDuration = 2000;
           mediaRecorder.start(chunkDuration);
           const recordingStartedAt = Date.now();
-          const initialAloneGraceMs = activateInactivityDetectionAfterMinutes * 60 * 1000;
 
           let dismissModalsInterval: NodeJS.Timeout;
           let lastDimissError: Error | null = null;
@@ -830,7 +932,12 @@ export class GoogleMeetBot extends MeetBotBase {
             }
           };
 
+          // Lets the node side (dashboard "Stop" button) end the recording cleanly:
+          // flush the recorder, save the last chunks, then leave the call.
+          (window as any).__meetingBotStop = () => stopTheRecording();
+
           let loneTest: NodeJS.Timeout;
+          let lastReportedCount: number | undefined;
           let detectionFailures = 0;
           let loneTestDetectionActive = true;
           const maxDetectionFailures = 10; // Track up to 10 consecutive failures
@@ -1029,6 +1136,10 @@ export class GoogleMeetBot extends MeetBotBase {
                     return;
                   }
                   detectionFailures = 0;
+                  if (contributors !== lastReportedCount) {
+                    lastReportedCount = contributors;
+                    try { (window as any).screenAppParticipants(slightlySecretId, contributors); } catch (e) { /* ignore */ }
+                  }
                   if (shouldStopForParticipantCount(contributors)) {
                     console.log('Bot is alone, ending meeting.');
                     loneTestDetectionActive = false;
@@ -1142,9 +1253,11 @@ export class GoogleMeetBot extends MeetBotBase {
            */
           detectLoneParticipantResilient();
 
-          inactivitySilenceDetectionTimeout = setTimeout(() => {
-            detectIncrediblySilentMeeting();
-          }, activateInactivityDetectionAfterMinutes * 60 * 1000);
+          if (silenceDetectionEnabled) {
+            inactivitySilenceDetectionTimeout = setTimeout(() => {
+              detectIncrediblySilentMeeting();
+            }, activateInactivityDetectionAfterMinutes * 60 * 1000);
+          }
 
           const detectModalsAndDismiss = () => {
             let dismissModalErrorCount = 0;
@@ -1265,6 +1378,10 @@ export class GoogleMeetBot extends MeetBotBase {
         duration,
         inactivityLimit,
         loneParticipantExitDelayMs,
+        initialAloneGraceMs,
+        silenceDetectionEnabled,
+        recorderBitrates,
+        videoConstraints,
         userId,
         slightlySecretId: this.slightlySecretId,
         activateInactivityDetectionAfterMinutes: config.activateInactivityDetectionAfter,
@@ -1273,27 +1390,60 @@ export class GoogleMeetBot extends MeetBotBase {
       }
     );
   
-    this._logger.info('Waiting for recording duration', config.maxRecordingDuration, 'minutes...');
+    this.recordingActive = true;
+    this.recordingStarted = true;
+    this.reporter?.phase('recording', 'Recording in progress');
+
+    this._logger.info(`Recording (up to ${Math.round(duration / 60000)} minutes)...`);
     const processingTime = 0.2 * 60 * 1000;
     const waitingPromise: WaitPromise = getWaitingPromise(processingTime + duration);
+    this.endRecordingEarly = () => waitingPromise.resolveEarly();
 
-    waitingPromise.promise.then(async () => {
-      const context = this.page.context();
-      // For an external CDP browser (the chrome-cdp sidecar), browser.close() only
-      // disconnects Playwright — it leaves the Meet tab open, so the bot stays in
-      // the call. Close the page (tab) instead, which leaves the meeting and keeps
-      // the shared sidecar Chrome alive for the next job.
-      if (isExternalBrowserContext(context)) {
-        this._logger.info('Closing the page (external CDP browser stays up)...');
-        await this.page.close();
-      } else {
-        this._logger.info('Closing the browser...');
-        await context.browser()?.close();
+    // If the bot's browser goes away on its own (crash, window closed by hand) don't wait for the
+    // max-duration timer: end now so what was captured so far gets saved.
+    const onBrowserGone = () => {
+      if (this.leavingOnPurpose) return;
+      this.browserClosedUnexpectedly = true;
+      this._logger.warn('Bot browser closed unexpectedly - ending the recording');
+      waitingPromise.resolveEarly();
+    };
+    this.page.once('close', onBrowserGone);
+    this.page.context().browser()?.once('disconnected', onBrowserGone);
+
+    const leaveMeeting = waitingPromise.promise.then(async () => {
+      this.leavingOnPurpose = true;
+      this.recordingActive = false;
+      this.reporter?.phase('leaving', 'Leaving the meeting');
+      try {
+        // Hang up properly so the other participants see the bot leave straight away
+        if (!this.page.isClosed()) {
+          await this.page.locator('button[aria-label="Leave call"], button[aria-label="Anruf verlassen"]').first().click({ timeout: 3000 });
+          await this.page.waitForTimeout(1000);
+        }
+      } catch (leaveError) {
+        this._logger.info('Leave call button not clicked (closing the page instead)');
+      }
+
+      try {
+        const context = this.page.context();
+        // For an external CDP browser (the chrome-cdp sidecar), browser.close() only
+        // disconnects Playwright — it leaves the Meet tab open, so the bot stays in
+        // the call. Close the page (tab) instead, which leaves the meeting and keeps
+        // the shared sidecar Chrome alive for the next job.
+        if (isExternalBrowserContext(context)) {
+          this._logger.info('Closing the page (external CDP browser stays up)...');
+          await this.page.close();
+        } else {
+          this._logger.info('Closing the browser...');
+          await context.browser()?.close();
+        }
+      } catch (closeError) {
+        this._logger.warn('Browser was already closed', { error: closeError });
       }
 
       this._logger.info('Recording stopped and meeting left; finalizing upload next...', { eventId, botId, userId, teamId });
     });
 
-    await waitingPromise.promise;
+    await leaveMeeting;
   }
 }

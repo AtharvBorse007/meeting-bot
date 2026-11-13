@@ -17,10 +17,9 @@ import { getStorageProvider } from '../uploader/providers/factory';
 import { getTimeString } from '../lib/datetime';
 import { notifyRecordingCompleted, RecordingCompletedPayload } from '../services/notificationService';
 import { writeWebmDurationMetadata } from '../lib/webmDuration';
+import { getMeetingCode } from '../util/recordingName';
 
-console.log(' ----- PWD OR CWD ----- ', process.cwd());
-
-const tempFolder = path.join(process.cwd(), 'dist', '_tempvideo');
+const tempFolder = config.tempVideoDir;
 const execFileAsync = promisify(execFile);
 
 function isNoSuchUploadError(err: any, userId: string, logger: Logger): boolean {
@@ -50,6 +49,8 @@ export interface IUploader {
   uploadRecordingToRemoteStorage(options?: { forceUpload?: boolean }): Promise<boolean>;
   saveDataToTempFile(data: Buffer): Promise<boolean>;
   setRecordingDuration(durationSeconds: number): void;
+  /** Local storage only: where the finished recording was saved (undefined until then). */
+  getSavedRecordingPath?(): string | undefined;
 }
 
 // Save to disk and upload in one session
@@ -322,6 +323,10 @@ class DiskUploader implements IUploader {
       this._logger.info('Error: Unable to save the chunk to disk...', this._userId, this._teamId, err);
       return false;
     }
+  }
+
+  public getSavedRecordingPath(): string | undefined {
+    return this.lastStorageDetails?.provider === 'local' ? this.lastStorageDetails.path : undefined;
   }
 
   public setRecordingDuration(durationSeconds: number): void {
@@ -782,10 +787,18 @@ class DiskUploader implements IUploader {
       // Upload recording to configured storage
       if (config.uploaderType === 'local') {
         const filePath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
-        const outDir = path.join(process.cwd(), 'recordings', this._userId);
+        const outDir = config.recordingsDir;
         await fs.promises.mkdir(outDir, { recursive: true });
-        const fileName = fileNameTemplate(this._namePrefix, getTimeString(this._timezone, this._logger));
-        const outPath = path.join(outDir, `${fileName}${this.fileExtension}`);
+        // Include the meeting code and never overwrite: several meetings can end in the same minute
+        const meetingCode = this._meetingLink ? getMeetingCode(this._meetingLink) : undefined;
+        const fileName = fileNameTemplate(
+          meetingCode ? `${this._namePrefix} - ${meetingCode} -` : this._namePrefix,
+          getTimeString(this._timezone, this._logger)
+        ).replace(/[<>:"/\|?*]/g, '-');
+        let outPath = path.join(outDir, `${fileName}${this.fileExtension}`);
+        for (let n = 2; fs.existsSync(outPath); n++) {
+          outPath = path.join(outDir, `${fileName} (${n})${this.fileExtension}`);
+        }
         await fs.promises.copyFile(filePath, outPath);
         this._logger.info(`Local upload finished. File saved to ${outPath}`);
         uploadResult = true;

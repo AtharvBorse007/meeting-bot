@@ -1,0 +1,624 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Lecture Recorder (pay per use) - records Google Meet lectures and publishes them to YouTube playlists.
+  A small always-on dashboard server, plus one AWS Fargate recorder task per lecture that exists only
+  while the lecture is recorded. Recordings stream to S3 every 30 seconds; a lost recorder is replaced
+  automatically. See docs/AWS.md.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Dashboard }
+        Parameters: [DomainName, AdminEmail, AdminInitialPassword, TimeZone]
+      - Label: { default: Recorders }
+        Parameters: [RecorderSize, UseSpot, MaxLecturesAtOnce]
+      - Label: { default: Server and storage }
+        Parameters: [DashboardInstanceType, DashboardDiskGb, DeepArchiveDays]
+      - Label: { default: Alerts and costs }
+        Parameters: [AlertEmail, MonthlyBudgetUsd]
+      - Label: { default: Access (optional) }
+        Parameters: [SshAllowedCidr, KeyPairName]
+      - Label: { default: Code }
+        Parameters: [RepoUrl, RepoBranch]
+    ParameterLabels:
+      DomainName: { default: Dashboard address }
+      AdminEmail: { default: Admin email }
+      AdminInitialPassword: { default: First admin password }
+      RecorderSize: { default: Recorder size (per lecture) }
+      UseSpot: { default: Use Fargate Spot (about 70% cheaper recorders) }
+      MaxLecturesAtOnce: { default: Most lectures at the same time }
+      AlertEmail: { default: Email for alerts }
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: ''
+    Description: >-
+      Address of the dashboard, e.g. recorder.yourdomain.com (no https://); point its DNS A record at the
+      PublicIp output. Leave EMPTY to start with a free temporary address (<ip>.sslip.io) and switch to your
+      own domain later with deploy/set-domain.sh.
+    AllowedPattern: '^$|^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'
+    ConstraintDescription: empty, or a domain name such as recorder.example.com
+  AdminEmail:
+    Type: String
+    Description: Email of the admin account (used to sign in to the dashboard).
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+  AdminInitialPassword:
+    Type: String
+    NoEcho: true
+    AllowedPattern: '^[A-Za-z0-9@%+=:,./_-]{8,64}$'
+    ConstraintDescription: '8-64 characters; letters, digits and @ % + = : , . / _ - only'
+    Description: Temporary password for the first sign-in (8-64 letters, digits or @%+=:,./_-). The dashboard makes you choose a new one immediately.
+  TimeZone:
+    Type: String
+    Default: Asia/Kolkata
+    Description: Time zone for dates and times in video titles.
+  RecorderSize:
+    Type: String
+    Default: medium
+    AllowedValues: [small, medium, large]
+    Description: >-
+      CPU and memory of each lecture's recorder task. small = 0.5 vCPU / 2 GB, medium = 1 vCPU / 3 GB
+      (recommended start), large = 2 vCPU / 4 GB. If lectures report "Recorder is very busy", choose large.
+  UseSpot:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Run recorders on Fargate Spot (about 70% cheaper). AWS may reclaim a Spot task with 2 minutes' notice;
+      a replacement then joins and takes over before the old one leaves, so normally nothing is missed.
+  MaxLecturesAtOnce:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+    Description: Safety limit on lectures recorded at the same time (each one is its own recorder task).
+  DashboardInstanceType:
+    Type: String
+    Default: t4g.micro
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium]
+    Description: The always-on dashboard server (no browsers run on it). t4g.micro is enough.
+  DashboardDiskGb:
+    Type: Number
+    Default: 30
+    MinValue: 20
+    MaxValue: 500
+    Description: Disk of the dashboard server (container image, recordings waiting for YouTube).
+  DeepArchiveDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 3650
+    Description: >-
+      Days after which backup copies of recordings move to S3 Glacier Deep Archive (very cheap; a download
+      then needs a restore that takes up to 12 hours). The videos stay on YouTube regardless.
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional. Receives alerts (dashboard server unhealthy) and budget warnings. Confirm the subscription email AWS sends.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: Monthly cost budget (USD); alert emails at 80% actual and 100% forecast. Needs AlertEmail.
+  SshAllowedCidr:
+    Type: String
+    Default: ''
+    Description: Optional. Allow SSH to the dashboard server only from this address range, e.g. 203.0.113.10/32. Leave empty to use AWS Session Manager only (recommended).
+    AllowedPattern: '^$|^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: Optional. Name of an existing EC2 key pair, only needed for SSH.
+  RepoUrl:
+    Type: String
+    Default: https://github.com/omkar-kokane/meeting-bot.git
+    Description: Git repository with the Lecture Recorder code (for a private repository include a read-only token in the URL).
+  RepoBranch:
+    Type: String
+    Default: main
+  UbuntuAmiArm64:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 ARM image for the dashboard server (looked up automatically).
+
+Mappings:
+  RecorderSizes:
+    small: { Cpu: '512', Memory: '2048' }
+    medium: { Cpu: '1024', Memory: '3072' }
+    large: { Cpu: '2048', Memory: '4096' }
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+  HasSsh: !Not [!Equals [!Ref SshAllowedCidr, '']]
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # ----------------------------------------------------------- network (free)
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lecture-recorder }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: lecture-recorder }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: lecture-recorder-a }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: lecture-recorder-b }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: lecture-recorder }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # S3 traffic (recording segments, backups) stays inside AWS - free, no NAT gateway
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PublicRouteTable]
+
+  DashboardSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Lecture Recorder dashboard - HTTP and HTTPS from anywhere, SSH only if configured
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP (certificate and redirect) }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+        - { IpProtocol: udp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTP/3 }
+        - !If
+          - HasSsh
+          - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref SshAllowedCidr, Description: SSH }
+          - !Ref AWS::NoValue
+      Tags: [{ Key: Name, Value: lecture-recorder-dashboard }]
+
+  RecorderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Lecture Recorder recorder tasks - nothing inbound; outbound to Google Meet, S3 and the dashboard
+      Tags: [{ Key: Name, Value: lecture-recorder-recorders }]
+
+  # ----------------------------------------------------------------- storage
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    # Recordings are kept even if the stack is deleted
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: recordings-to-deep-archive
+            Status: Enabled
+            Prefix: recordings/
+            Transitions:
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: !Ref DeepArchiveDays
+          # The 30-second pieces recorders upload; joined into one file right after the lecture
+          - Id: expire-recording-segments
+            Status: Enabled
+            Prefix: segments/
+            ExpirationInDays: 3
+          - Id: expire-old-database-backups
+            Status: Enabled
+            Prefix: db-backups/
+            ExpirationInDays: 90
+          - Id: tidy-up
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+      Tags: [{ Key: app, Value: lecture-recorder }]
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: HttpsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+  # The recorder container image (built on the dashboard server, which has the same ARM architecture)
+  RecorderRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep the last 3 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}
+      Tags: [{ Key: app, Value: lecture-recorder }]
+
+  # ------------------------------------------------------- recorder tasks
+  RecorderCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      Tags: [{ Key: app, Value: lecture-recorder }]
+
+  RecorderLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/lecture-recorder/${AWS::StackName}/recorders'
+      RetentionInDays: 14
+
+  RecorderExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets Fargate pull the recorder image and write its logs
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  RecorderTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Recorder tasks may only upload recording segments to the backup bucket
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: upload-segments
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${BackupBucket.Arn}/segments/*'
+
+  RecorderTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-recorder'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !FindInMap [RecorderSizes, !Ref RecorderSize, Cpu]
+      Memory: !FindInMap [RecorderSizes, !Ref RecorderSize, Memory]
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt RecorderExecutionRole.Arn
+      TaskRoleArn: !GetAtt RecorderTaskRole.Arn
+      ContainerDefinitions:
+        - Name: recorder
+          Image: !Sub '${RecorderRepository.RepositoryUri}:latest'
+          Essential: true
+          # Time to hand over to a replacement when AWS stops the task (the maximum Fargate allows)
+          StopTimeout: 120
+          Environment:
+            - { Name: APP_ROLE, Value: recorder }
+            - { Name: ARCHIVE_S3_BUCKET, Value: !Ref BackupBucket }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: TZ, Value: !Ref TimeZone }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref RecorderLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: lecture
+
+  # --------------------------------------------------------- dashboard server
+  DashboardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lecture Recorder dashboard - starts recorder tasks, backups in S3, pushes the recorder image, Session Manager
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: lecture-recorder
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BackupBucket
+                Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketMultipartUploads]
+                Resource: !GetAtt BackupBucket.Arn
+              - Sid: BackupObjects
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+                Resource: !Sub '${BackupBucket.Arn}/*'
+              - Sid: StartRecorders
+                Effect: Allow
+                Action: [ecs:RunTask, ecs:TagResource]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AWS::StackName}-recorder:*'
+                  - !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RecorderCluster}/*'
+              - Sid: WatchRecorders
+                Effect: Allow
+                Action: [ecs:DescribeTasks, ecs:StopTask]
+                Resource: !Sub 'arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${RecorderCluster}/*'
+              - Sid: PassRecorderRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt RecorderExecutionRole.Arn, !GetAtt RecorderTaskRole.Arn]
+              - Sid: PushRecorderImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                Resource: !GetAtt RecorderRepository.Arn
+              - Sid: RegistryLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+
+  DashboardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref DashboardRole]
+
+  # IMDSv2 only; hop limit 2 so the app in its container can use the server's role
+  DashboardLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+
+  Dashboard:
+    Type: AWS::EC2::Instance
+    DependsOn: DefaultRoute
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DashboardLaunchTemplate
+        Version: !GetAtt DashboardLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref DashboardInstanceType
+      ImageId: !Ref UbuntuAmiArm64
+      IamInstanceProfile: !Ref DashboardInstanceProfile
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds: [!GetAtt DashboardSecurityGroup.GroupId]
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref AWS::NoValue]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref DashboardDiskGb
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: lecture-recorder-dashboard }
+        - { Key: app, Value: lecture-recorder }
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # Installs Lecture Recorder on first boot. Progress: /var/log/lecture-recorder-setup.log
+            set -euo pipefail
+            exec >>/var/log/lecture-recorder-setup.log 2>&1
+            echo "=== $(date -u) setup start"
+            APP_DIR=/opt/lecture-recorder
+            if [ -f $APP_DIR/.installed ]; then echo "already installed"; exit 0; fi
+            export DEBIAN_FRONTEND=noninteractive
+            for attempt in $(seq 1 60); do
+              if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+              sleep 5
+            done
+            apt-get update -y
+            apt-get install -y git
+            if [ ! -d $APP_DIR/.git ]; then
+              git clone --depth 1 --branch '${RepoBranch}' '${RepoUrl}' $APP_DIR
+            fi
+            cd $APP_DIR/deploy
+            if [ ! -f .env ]; then
+              # Quoted heredoc: the values are written exactly as entered, never run by the shell
+              cat > .env <<'SETTINGS'
+            DOMAIN=${Hostname}
+            ADMIN_EMAIL=${AdminEmail}
+            ADMIN_PASSWORD=${AdminInitialPassword}
+            TZ=${TimeZone}
+            AWS_REGION=${AWS::Region}
+            ARCHIVE_S3_BUCKET=${BackupBucket}
+            ARCHIVE_S3_STORAGE_CLASS=STANDARD
+            ARCHIVE_DEEP_ARCHIVE_DAYS=${DeepArchiveDays}
+            RECORDER_MODE=ecs
+            MAX_CONCURRENT_BOTS=${MaxLecturesAtOnce}
+            ECS_CLUSTER=${RecorderCluster}
+            ECS_TASK_DEFINITION=${AWS::StackName}-recorder
+            ECS_SUBNETS=${PublicSubnetA},${PublicSubnetB}
+            ECS_SECURITY_GROUPS=${RecorderSecurityGroup.GroupId}
+            ECS_USE_SPOT=${UseSpot}
+            ECR_REPOSITORY_URI=${RecorderRepository.RepositoryUri}
+            LOCAL_RETENTION_DAYS=2
+            LOW_DISK_GB=4
+            SETTINGS
+              grep -vE '^(DOMAIN|ADMIN_EMAIL|ADMIN_PASSWORD|TZ|AWS_REGION|ARCHIVE_S3_BUCKET|ARCHIVE_S3_STORAGE_CLASS|ARCHIVE_DEEP_ARCHIVE_DAYS|RECORDER_MODE|MAX_CONCURRENT_BOTS|ECS_[A-Z_]+|ECR_REPOSITORY_URI|LOCAL_RETENTION_DAYS|LOW_DISK_GB)=' .env.example >> .env
+              chmod 600 .env
+            fi
+            bash install.sh
+            # The recorder tasks run the same image: publish it to the registry
+            bash aws/push-recorder-image.sh
+            touch $APP_DIR/.installed
+            echo "=== $(date -u) setup finished"
+          - Hostname: !If [HasDomain, !Ref DomainName, !Sub '${DashboardIp}.sslip.io']
+
+  # Created before the server (and attached separately) so the server's start-up script can use the address
+  DashboardIp:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: lecture-recorder }]
+
+  DashboardIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt DashboardIp.AllocationId
+      InstanceId: !Ref Dashboard
+
+  # --------------------------------------------------------- health and alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      DisplayName: Lecture Recorder alerts
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref AlertEmail }
+
+  # AWS hardware problem: move the server to healthy hardware (same IP, same disk)
+  RecoverOnSystemFailure:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lecture Recorder dashboard failed the system status check - recovering it
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions: [{ Name: InstanceId, Value: !Ref Dashboard }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover'
+        - !If [HasAlertEmail, !Ref AlertTopic, !Ref AWS::NoValue]
+
+  # The operating system stopped responding: reboot it (recorders keep recording meanwhile)
+  RebootOnInstanceFailure:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lecture Recorder dashboard failed the instance status check - rebooting it
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions: [{ Name: InstanceId, Value: !Ref Dashboard }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:reboot'
+        - !If [HasAlertEmail, !Ref AlertTopic, !Ref AWS::NoValue]
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub 'lecture-recorder-${AWS::StackName}'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+Outputs:
+  PublicIp:
+    Description: Create a DNS A record for your dashboard address pointing at this IP
+    Value: !Ref DashboardIp
+  DnsRecord:
+    Description: The DNS record to create at your domain provider
+    Value: !If
+      - HasDomain
+      - !Sub '${DomainName}  A  ${DashboardIp}'
+      - 'Not needed yet - a temporary sslip.io address is used. Later run deploy/set-domain.sh with your domain.'
+  DashboardUrl:
+    Description: The dashboard (ready about 15-20 minutes after the stack is created)
+    Value: !If [HasDomain, !Sub 'https://${DomainName}', !Sub 'https://${DashboardIp}.sslip.io']
+  YouTubeRedirectUri:
+    Description: Register this as an authorised redirect URI on the Google OAuth client
+    Value: !If [HasDomain, !Sub 'https://${DomainName}/api/youtube/callback', !Sub 'https://${DashboardIp}.sslip.io/api/youtube/callback']
+  BackupBucketName:
+    Description: S3 bucket with the recordings, the recording segments and the database backups (kept if the stack is deleted)
+    Value: !Ref BackupBucket
+  RecorderLogsUrl:
+    Description: Logs of the recorder tasks (CloudWatch)
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${RecorderLogs}'
+  ServerShell:
+    Description: Open a terminal on the dashboard server in the browser (AWS Session Manager)
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${Dashboard}?region=${AWS::Region}'
+  SetupLog:
+    Description: In the server terminal, follow the installation with this command
+    Value: sudo tail -f /var/log/lecture-recorder-setup.log

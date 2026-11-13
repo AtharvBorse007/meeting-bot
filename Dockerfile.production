@@ -71,6 +71,8 @@ COPY . .
 
 # Set environment variables
 ENV NODE_ENV=production
+# Containers must listen on all interfaces (the app defaults to localhost only)
+ENV HOST=0.0.0.0
 
 # Set xvfb-run-wrapper permissions
 RUN dos2unix /usr/src/app/xvfb-run-wrapper && \

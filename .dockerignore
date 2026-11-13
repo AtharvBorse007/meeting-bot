@@ -1,7 +1,15 @@
 node_modules
 dist
+data
+recordings
+debug-screenshots
+debug-videos
+scripts/tmp
 *.log
 .DS_Store
 .git
 .gitignore
 .vscode
+.idea
+.env
+deploy/.env

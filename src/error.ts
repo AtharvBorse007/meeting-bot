@@ -27,6 +27,13 @@ export class WaitingAtLobbyRetryError extends KnownError {
   }
 }
 
+/** The user asked the bot to stop before the recording had started. Never retried. */
+export class MeetingCancelledError extends KnownError {
+  constructor(message = 'Cancelled before the bot joined the meeting') {
+    super(message, false, 0);
+  }
+}
+
 export class MeetingTimeoutError extends Error {
   constructor(message: string) {
     super(message);

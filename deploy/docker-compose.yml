@@ -1,0 +1,55 @@
+# Lecture Recorder on one server: the app plus Caddy for HTTPS on your domain.
+#
+#   cd deploy
+#   cp .env.example .env      # then fill in DOMAIN etc.
+#   docker compose up -d --build
+#
+# See docs/SETUP.md for the full walk-through.
+
+name: lecture-recorder
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PUBLIC_URL: https://${DOMAIN:?Set DOMAIN in deploy/.env}
+      TRUST_PROXY: "true"
+    volumes:
+      - lecture-data:/app/data
+    # Chrome needs more shared memory than Docker's 64 MB default
+    shm_size: 2gb
+    # Time to leave the meetings and save the recordings on "docker compose down" / restarts
+    stop_grace_period: 2m
+    expose:
+      - "3000"
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+
+volumes:
+  # Database, recordings and logs. Back it up with deploy/backup.sh
+  lecture-data:
+  caddy-data:
+  caddy-config:

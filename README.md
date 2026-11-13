@@ -1,24 +1,82 @@
-# Meeting Bot 🤖
+# Lecture Recorder
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-43853D?style=flat&logo=node.js&logoColor=white)](https://nodejs.org/)
-[![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
+Records online lectures (Google Meet) and publishes them to YouTube, one playlist per subject.
+An instructor signs in, picks the subject, pastes the meeting link and presses **Join & record**;
+a recorder joins the meeting, records everything participants see and hear (speaker, shared
+screens, all audio), and when the lecture ends the video is uploaded as **unlisted** to the
+subject's YouTube playlist. It runs on one Linux VM behind your own domain, on **AWS, Google Cloud,
+Azure or Oracle** (Oracle's Always Free VM makes the running cost zero).
 
-An open-source automation bot for joining and recording video meetings across multiple platforms including Google Meet, Microsoft Teams, and Zoom. Built with TypeScript, Node.js, and Playwright for reliable browser automation.
+**On AWS (pay per use):** follow [docs/AWS.md](docs/AWS.md) — one CloudFormation template creates a
+small always-on dashboard server and starts one Fargate recorder task per lecture, only while it is
+recorded (about $20–40 a month). A lost recorder is replaced automatically; recordings stream to S3
+every 30 seconds.
 
-## ✨ Features
+**Elsewhere:** follow [docs/SETUP.md](docs/SETUP.md) (VM on any cloud via [docs/CLOUD.md](docs/CLOUD.md)
+→ DNS → `deploy/install.sh` → connect YouTube). On every cloud, pasting
+[`deploy/cloud-init.sh`](deploy/cloud-init.sh) into the VM's start-up script field installs it
+unattended.
 
-- **Multi-Platform Support**: Join meetings on Google Meet, Microsoft Teams, and Zoom
-- **Automated Recording**: Capture meeting recordings with configurable duration limits
-- **Single Job Execution**: Ensures only one meeting is processed at a time across the entire system
-- **Dual Integration Options**: RESTful API endpoints and Redis message queue for flexible integration
-- **Asynchronous Processing**: Redis queue support for high-throughput, scalable meeting requests
-- **Docker Support**: Containerized deployment with Docker and Docker Compose
-- **Graceful Shutdown**: Proper cleanup and resource management
-- **Prometheus Metrics**: Built-in monitoring and metrics collection
-- **Stealth Mode**: Advanced browser automation with anti-detection measures
-- **Completion Notifications**: Optional webhook and Redis notifications when a recording is completed
+## How it works
+
+| | |
+|---|---|
+| **Admin** | creates instructor accounts, creates subjects (each one is a YouTube playlist), assigns subjects to instructors, connects the YouTube channel, sees every lecture |
+| **Instructor** | signs in, picks one of their subjects, pastes the Meet link, presses **Join & record**; presses **End & save** to stop early; sees their own lectures with Watch / Playlist links |
+| **Recorder** | a real browser per lecture (up to `MAX_CONCURRENT_BOTS`, default 3, at the same time), joins as a guest named `BOT_NAME`, records the meeting tab with its audio, keeps recording through silence, leaves when the meeting ends, after 10 minutes alone, after 5 hours, or on **End** |
+| **Uploader** | sends finished recordings to YouTube one at a time, resumes interrupted uploads, retries failures with growing pauses, waits (without losing anything) while YouTube is not connected |
+
+The dashboard updates live (Server-Sent Events): status (starting → joining → waiting to be
+admitted → recording → saving → uploading → on YouTube), recording time, size, people in the call
+and an activity log per lecture.
+
+Robustness: every lecture is stored in a SQLite database (`data/meetingbot.db`); if the server
+restarts during a lecture, the part recorded so far is saved and uploaded. A recording's server copy
+is only deleted once the video is on YouTube and in its playlist (after `LOCAL_RETENTION_DAYS`, or
+earlier when disk space runs low).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `src/app/api.ts` | dashboard API: sign-in, lectures, live events, admin (users, subjects, YouTube) |
+| `src/auth/` | passwords (scrypt), session cookies, sign-in limits, first admin account |
+| `src/db/` | SQLite schema and queries (Node's built-in `node:sqlite`) |
+| `src/lectures/LectureManager.ts` | runs one recorder per lecture, End/cancel, restart recovery |
+| `src/youtube/` | YouTube sign-in, playlists, resumable uploads, upload queue and clean-up |
+| `src/archive/` | S3 backup of every recording and a daily database backup |
+| `src/recorders/`, `src/worker/` | pay-per-use mode: one recorder task per lecture (ECS/Fargate), heartbeats, replacement of lost recorders, joining the parts |
+| `src/bots/GoogleMeetBot.ts` | joins Google Meet and records the tab (MediaRecorder) |
+| `ui/` | the dashboard (plain HTML/CSS/JS, no build step) |
+| `deploy/` | Docker Compose (app + Caddy for HTTPS), unattended cloud start-up script, install / update / backup / restore / password-reset scripts |
+| `deploy/aws/lecture-recorder.yaml` | CloudFormation template for the complete AWS setup |
+| `docs/AWS.md` | AWS setup, costs and operations |
+| `docs/CLOUD.md` | creating the VM on AWS, Google Cloud, Azure or Oracle (console steps and CLI) |
+| `docs/SETUP.md` | step-by-step server and YouTube setup |
+
+## Running it on your computer (development)
+
+Needs Node.js 22.13 or newer and Google Chrome.
+
+```bash
+npm install
+node scripts/dev/dev-server.js     # http://localhost:3055 with a fake Google Meet and a fake YouTube
+node scripts/dev/e2e.js            # end-to-end test of the whole product against the same fakes
+```
+
+`dev-server.js` prints the admin sign-in on its first start (data in `data/dev-mock/`). The fake
+meeting understands any code; `eee-nnnn-ddd` ends by itself after ~25 s and `lll-oooo-bbb` is
+never admitted. To run against real Google Meet and YouTube instead, use `npm run local`
+(or the `Start Meeting Bot` scripts), with `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` in `.env`.
+
+Settings are environment variables; the deployed ones are documented in
+[deploy/.env.example](deploy/.env.example).
+
+---
+
+# Underlying meeting-bot service (original API)
+
+Everything below documents the original multi-platform bot this project is built on. Its unauthenticated REST routes (`/google/join`, `/microsoft/join`, `/zoom/join`, `/status`, `/metrics`) are switched off unless `LEGACY_API_ENABLED=true`; never enable that on a public address.
 
 ## 🚀 Quick Start
 
@@ -63,9 +121,9 @@ The server will start on `http://localhost:3000`
 
 ### How Meeting Bot Works
 
-Meeting Bot operates with a single job execution model to ensure reliable meeting processing:
+Every meeting runs in its own browser, so several can be recorded at once:
 
-- **Single Job Processing**: Meeting Bot accepts only one job at a time and works until it's completely finished before accepting another job
+- **Concurrent Processing**: Meeting Bot accepts jobs until `MAX_CONCURRENT_BOTS` (default 3) are running; `/status`, `/isbusy` and the metrics report "busy" only when that limit is reached. Set `MAX_CONCURRENT_BOTS=1` for the previous one-at-a-time behaviour (Teams jobs already run on their own automatically)
 - **Automatic Retry**: The bot automatically retries on certain errors such as automation failures or when it takes too long to admit the bot into a meeting
 
 ### API Endpoints

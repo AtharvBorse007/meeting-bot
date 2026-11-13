@@ -1,27 +1,59 @@
 import { Logger } from 'winston';
 import { KnownError } from '../error';
 import { getErrorType } from '../util/logger';
+import config from '../config';
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Tracks the meetings being recorded. Up to `config.maxConcurrentBots` run at once; every bot
+ * launches its own browser, so they don't share any state.
+ */
 export class JobStore {
-  private isRunning: boolean = false;
+  private runningCount: number = 0;
+  private exclusiveRunning: boolean = false;
   private shutdownRequested: boolean = false;
 
+  /**
+   * Reserve a slot for a job that manages its own lifecycle (e.g. a dashboard session).
+   * Returns a release function, or null when at capacity or shutting down.
+   * An `exclusive` job (Microsoft Teams: its ffmpeg recorder uses the one shared virtual display and
+   * audio device) only starts when nothing else is running and keeps everything else out until it ends.
+   * The release function is idempotent.
+   */
+  tryAcquire(options?: { exclusive?: boolean }): (() => void) | null {
+    const exclusive = options?.exclusive === true;
+    if (this.shutdownRequested || this.exclusiveRunning) {
+      return null;
+    }
+    if (exclusive ? this.runningCount > 0 : this.runningCount >= config.maxConcurrentBots) {
+      return null;
+    }
+    this.runningCount += 1;
+    if (exclusive) this.exclusiveRunning = true;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.runningCount -= 1;
+      if (exclusive) this.exclusiveRunning = false;
+    };
+  }
+
   async addJob<T>(
-    task: () => Promise<T>, 
+    task: () => Promise<T>,
     logger: Logger,
     retryCount: number = 0,
     onPermanentFailure?: (error: unknown) => Promise<void> | void,
-    onCompleted?: () => Promise<void> | void
+    onCompleted?: () => Promise<void> | void,
+    options?: { exclusive?: boolean }
   ): Promise<{ accepted: boolean }> {
-    if (this.isRunning || this.shutdownRequested) {
+    const release = this.tryAcquire(options);
+    if (!release) {
       return { accepted: false };
     }
 
-    this.isRunning = true;
-    
     // Execute the task asynchronously without waiting for completion
     this.executeTaskWithRetry(task, logger, retryCount).then(async () => {
       logger.info('LogBasedMetric Bot has finished recording meeting successfully.');
@@ -47,9 +79,7 @@ export class JobStore {
           logger.warn('Meeting failure notification failed', failureNotificationError as any);
         }
       }
-    }).finally(() => {
-      this.isRunning = false;
-    });
+    }).finally(release);
 
     logger.info('LogBasedMetric Bot job has been queued and started recording meeting.');
     return { accepted: true };
@@ -86,8 +116,18 @@ export class JobStore {
     }
   }
 
+  /** True when no further job can be accepted (at capacity). */
   isBusy(): boolean {
-    return this.isRunning;
+    return this.exclusiveRunning || this.runningCount >= config.maxConcurrentBots;
+  }
+
+  /** Number of meetings currently being processed. */
+  activeCount(): number {
+    return this.runningCount;
+  }
+
+  get capacity(): number {
+    return config.maxConcurrentBots;
   }
 
   /**
@@ -109,15 +149,15 @@ export class JobStore {
    * @returns Promise that resolves when all tasks are complete
    */
   async waitForCompletion(): Promise<void> {
-    if (!this.isRunning) {
+    if (this.runningCount === 0) {
       return; // No tasks running, can shutdown immediately
     }
 
     console.log('Waiting for ongoing tasks to complete...');
-    
+
     return new Promise<void>((resolve) => {
       const checkCompletion = () => {
-        if (!this.isRunning) {
+        if (this.runningCount === 0) {
           console.log('All tasks completed successfully');
           resolve();
         } else {
@@ -127,4 +167,4 @@ export class JobStore {
       checkCompletion();
     });
   }
-} 
+}

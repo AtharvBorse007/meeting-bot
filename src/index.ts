@@ -7,15 +7,61 @@ import messageBroker from './connect/messageBroker';
 import config from './config';
 import { isPodMarkedForDeletion } from './util/k8sLifecycle';
 import { loggerFactory } from './util/logger';
+import { lectureManager } from './lectures/LectureManager';
+import { uploadWorker } from './youtube/UploadWorker';
+import { archiveWorker } from './archive/ArchiveWorker';
+import { ensureAdminAccount, purgeExpiredSessions } from './auth';
+import { closeDb, getDb } from './db';
+import { spawn } from 'child_process';
 
-const port = 3000;
+const port = config.port;
 
 // Create Express server
 const server = http.createServer(app);
 
-server.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
+server.on('error', (error: NodeJS.ErrnoException) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${port} is already in use. Close the other program (or an already running Meeting Bot), or start with a different port: PORT=3001`);
+  } else {
+    console.error('Server error:', error);
+  }
+  process.exit(1);
 });
+
+// Prepare everything the dashboard needs, then start accepting requests
+async function start() {
+  getDb(); // opens data/meetingbot.db and applies schema changes
+  await ensureAdminAccount();
+  purgeExpiredSessions();
+  lectureManager.recoverAfterRestart();
+  lectureManager.startEngine();
+  uploadWorker.start();
+  archiveWorker.start();
+
+  server.listen(port, config.host, () => {
+    const url = `http://localhost:${port}`;
+    console.log(`Server is running on ${url}`);
+    if (process.env.OPEN_BROWSER === 'true') {
+      openInBrowser(url);
+    }
+  });
+}
+
+start().catch((error) => {
+  console.error('Could not start the server:', error);
+  process.exit(1);
+});
+
+// Open the dashboard in the user's default browser (used by the start scripts)
+function openInBrowser(url: string) {
+  const [command, args]: [string, string[]] =
+    process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]] :
+    process.platform === 'darwin' ? ['open', [url]] :
+    ['xdg-open', [url]];
+  const child = spawn(command, args, { stdio: 'ignore', detached: true });
+  child.on('error', () => console.log(`Open ${url} in your browser to use the dashboard.`));
+  child.unref();
+}
 
 // Detect the "SIGTERM lost during ContainerCreating" race: if K8s marked us for deletion
 // before the container's PID 1 existed, the SIGTERM was silently dropped. Without this
@@ -57,6 +103,15 @@ const initiateGracefulShutdown = async () => {
     // Request shutdown on the job store (prevents new jobs from being accepted)
     globalJobStore.requestShutdown();
 
+    // Meetings started from the dashboard: leave them and save what has been recorded so far
+    const { active } = lectureManager.counts();
+    if (active > 0) {
+      console.log(`Stopping ${active} recording(s) and saving them - press Ctrl+C again to quit immediately.`);
+    }
+    uploadWorker.stop();
+    archiveWorker.stop();
+    await lectureManager.shutdown();
+
     // Wait for ongoing tasks to complete (no timeout - wait indefinitely)
     await globalJobStore.waitForCompletion();
 
@@ -83,7 +138,17 @@ process.on('SIGTERM', () => {
 });
 
 process.on('SIGINT', () => {
+  if (shutdownInProgress) {
+    console.log('Second Ctrl+C - quitting immediately.');
+    process.exit(1);
+  }
   console.log('SIGINT signal received. Starting Graceful Shutdown');
+  initiateGracefulShutdown();
+});
+
+process.on('SIGHUP', () => {
+  // The terminal window running the launcher was closed: save recordings before exiting
+  console.log('SIGHUP signal received. Starting Graceful Shutdown');
   initiateGracefulShutdown();
 });
 
@@ -94,6 +159,8 @@ process.on('SIGABRT', () => {
 
 export const gracefulShutdownApp = () => {
   // Complete existing requests, close database connections, etc.
+  // (dashboards hold long-lived event streams open, which would otherwise keep the server alive)
+  server.closeAllConnections?.();
   server.close(async () => {
     console.log('HTTP server closed. Exiting application');
 
@@ -105,6 +172,7 @@ export const gracefulShutdownApp = () => {
       console.log('Redis services not running - skipping Redis shutdown');
     }
 
+    closeDb();
     console.log('Exiting.....');
     process.exit(0);
   });

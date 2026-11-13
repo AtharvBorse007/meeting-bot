@@ -194,7 +194,7 @@ export class RedisConsumerService {
         await messageBroker.acknowledgeProcessingMeetingbotJob(message);
       }, async () => {
         await messageBroker.acknowledgeProcessingMeetingbotJob(message);
-      });
+      }, { exclusive: meetingParams.provider === 'microsoft' }); // Teams' ffmpeg recorder can't share the display/audio device
 
       jobAccepted = jobAcceptedResult.accepted;
 
@@ -204,6 +204,9 @@ export class RedisConsumerService {
         logger.warn('Message rejected by JobStore - race condition detected, returning to queue');
         // Race condition: external API request got through, put message back at head of pending queue.
         await messageBroker.returnProcessingMeetingbotJob(message);
+        // The job can be refused while other meetings are still running (e.g. a Teams job waits for
+        // an empty worker). Pause so the loop doesn't re-pop the same message in a tight spin.
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
 
     } catch (error) {

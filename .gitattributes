@@ -1,3 +1,5 @@
 *.sh text eol=lf
 start.sh text eol=lf
 xvfb-run-wrapper text eol=lf
+*.command text eol=lf
+*.bat text eol=crlf

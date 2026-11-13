@@ -1,6 +1,8 @@
 import config, { NODE_ENV } from '../config';
 import { Storage } from '@google-cloud/storage';
 import { Logger } from 'winston';
+import fs from 'fs';
+import path from 'path';
 
 interface UploadOption {
   skipTimestamp?: boolean;
@@ -22,7 +24,20 @@ async function uploadImageToGCP(
   }
 }
 
-// TODO Save to local volume for development
+// Local mode: keep debug screenshots on disk so a failed join can be diagnosed
+async function saveDebugImageLocally(buffer: Buffer, fileName: string, botId: string, logger: Logger) {
+  try {
+    await fs.promises.mkdir(config.debugDir, { recursive: true });
+    const safe = (v: string) => v.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 60);
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(config.debugDir, `${safe(botId)}-${safe(fileName)}-${stamp}.png`);
+    await fs.promises.writeFile(file, buffer);
+    logger.info(`Debug screenshot saved: ${file}`);
+  } catch (error) {
+    logger.warn('Could not save debug screenshot', error as any);
+  }
+}
+
 export const uploadDebugImage = async (
   buffer: Buffer,
   fileName: string,
@@ -32,6 +47,10 @@ export const uploadDebugImage = async (
   opts?: UploadOption
 ) => {
   try {
+    if (config.uploaderType === 'local') {
+      await saveDebugImageLocally(buffer, fileName, botId ?? 'bot', logger);
+      return;
+    }
     if (NODE_ENV === 'development') {
       // TODO add disk based file saving
       return;

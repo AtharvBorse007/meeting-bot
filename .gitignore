@@ -14,6 +14,12 @@ gcp-key
 assets/screenshots
 /data
 debug-videos/
+
+# Local-mode output
+recordings/
+debug-screenshots/
+data/
+scripts/tmp/
 .env.native
 
 # Local-only docker compose override for signal-handling testing — see compose.override.yml header

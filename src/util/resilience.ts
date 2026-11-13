@@ -25,7 +25,8 @@ export async function retryActionWithWait<T>(
   logger: Logger,
   attempts: number = 3,
   waitMs: number = 20000,
-  onError?: () => Promise<void>
+  onError?: () => Promise<void>,
+  shouldAbort?: () => boolean
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -34,6 +35,10 @@ export async function retryActionWithWait<T>(
       return result;
     } catch (err) {
       lastError = err;
+      // Stop immediately (no waiting, no debug hook) when the caller has given up, e.g. a cancel request
+      if (shouldAbort?.()) {
+        throw lastError;
+      }
       if (attempt < attempts) {
         logger.warn(`Retry ${attempt} on "${actionName}" action`);
         await sleepUntil(waitMs);

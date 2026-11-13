@@ -124,7 +124,21 @@ async function launchPersistentContextWithTimeout(launchFn: () => Promise<Browse
   });
 }
 
-async function createBrowserContext(url: string, correlationId: string, botType: BotType = 'google'): Promise<Page> {
+export interface BrowserContextOptions {
+  /** Index of the bot window among the bots running right now (0, 1, 2...). Used to cascade windows. */
+  windowSlot?: number;
+}
+
+function getWindowPositionArg(slot: number): string {
+  if (config.botWindowPosition === 'offscreen') {
+    // Still "visible" to Chrome (so rendering and tab capture keep running), just outside the desktop
+    return '--window-position=-3000,-3000';
+  }
+  const offset = 36 * (slot % 8);
+  return `--window-position=${offset},${offset}`;
+}
+
+async function createBrowserContext(url: string, correlationId: string, botType: BotType = 'google', options: BrowserContextOptions = {}): Promise<Page> {
   const size = { width: 1280, height: 720 };
   const browserWindowSize = { width: size.width, height: size.height + 80 };
 
@@ -144,8 +158,17 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     '--no-sandbox',
     '--disable-setuid-sandbox',
     `--window-size=${browserWindowSize.width},${browserWindowSize.height}`,
+    getWindowPositionArg(options.windowSlot ?? 0),
     '--auto-accept-this-tab-capture',
     '--autoplay-policy=no-user-gesture-required',
+    // Several bots run side by side, so a window can end up partly covered by another one.
+    // Without these Chrome throttles/pauses covered windows and the tab recording would stall.
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-features=CalculateNativeWinOcclusion',
+    // Containers (and AWS Fargate, which allows no bigger /dev/shm) have little shared memory
+    '--disable-dev-shm-usage',
   ];
 
   const recordingBrowserArgs: string[] = [

@@ -76,7 +76,7 @@ const joinMicrosoftTeams = async (req: Request, res: Response) => {
       eventId,
       botId,
       provider: 'microsoft',
-    }, error, logger));
+    }, error, logger), undefined, { exclusive: true }); // Teams' ffmpeg recorder can't share the display/audio device
 
     if (!jobResult.accepted) {
       return res.status(409).json({
