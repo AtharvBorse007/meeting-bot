@@ -167,9 +167,8 @@ public address).
 repository pushed to GitHub (public, or private with a read-only token in `RepoUrl`), a Google
 account for the YouTube channel.
 
-> The product currently lives on the **`lecture-recorder`** branch (the template's `RepoBranch`
-> default). If you fork, keep that branch name or change the parameter. After merging to `main`,
-> set `RepoBranch=main`.
+> The server deploys the **`main`** branch of `RepoUrl` (parameter `RepoBranch`). If you fork,
+> point `RepoUrl` at your fork.
 
 ### 4.1 Create the stack
 
@@ -184,7 +183,7 @@ Console: **CloudFormation → Create stack → With new resources → Upload a t
 | RecorderSize | `medium` (1 vCPU / 3 GB) |
 | UseSpot | `false` to start |
 | AlertEmail, MonthlyBudgetUsd | your email, e.g. 50 |
-| RepoUrl, RepoBranch | your fork; `lecture-recorder` |
+| RepoUrl, RepoBranch | your fork; `main` |
 | everything else | defaults |
 
 Tick the IAM acknowledgement and create. CLI equivalent:
