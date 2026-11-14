@@ -196,7 +196,11 @@ router.get('/lectures/:id/file', requireAuth, wrap(async (req, res) => {
     return;
   }
   // The server copy has been cleaned up: hand out a short-lived link to the S3 backup instead
-  if (archiveEnabled() && lecture.archiveStatus === 'done' && lecture.archiveKey && lecture.fileName) {
+  const view = lectureManager.view(lecture);
+  if (view.backupInDeepArchive) {
+    throw new HttpError(409, 'The backup copy is in S3 Glacier Deep Archive. Restore it in the S3 console first (up to 12 hours); the video is still on YouTube.');
+  }
+  if (archiveEnabled() && view.backupAvailable && lecture.archiveKey && lecture.fileName) {
     res.redirect(await downloadUrl(lecture.archiveKey, lecture.fileName.split('/').pop() as string));
     return;
   }

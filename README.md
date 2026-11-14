@@ -7,6 +7,8 @@ screens, all audio), and when the lecture ends the video is uploaded as **unlist
 subject's YouTube playlist. It runs on one Linux VM behind your own domain, on **AWS, Google Cloud,
 Azure or Oracle** (Oracle's Always Free VM makes the running cost zero).
 
+**Start here:** [DEPLOYMENT.md](DEPLOYMENT.md) — architecture, deployment, configuration, operations and the first-deployment checklist in one file.
+
 **On AWS (pay per use):** follow [docs/AWS.md](docs/AWS.md) — one CloudFormation template creates a
 small always-on dashboard server and starts one Fargate recorder task per lecture, only while it is
 recorded (about $20–40 a month). A lost recorder is replaced automatically; recordings stream to S3

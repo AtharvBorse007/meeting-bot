@@ -116,7 +116,8 @@ Parameters:
     Description: Git repository with the Lecture Recorder code (for a private repository include a read-only token in the URL).
   RepoBranch:
     Type: String
-    Default: main
+    Default: lecture-recorder
+    Description: Branch to deploy. The product lives on lecture-recorder until it is merged into main.
   UbuntuAmiArm64:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
