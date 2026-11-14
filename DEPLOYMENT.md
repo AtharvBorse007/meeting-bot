@@ -229,6 +229,25 @@ Sign in at `DashboardUrl`, change the password, add **Subjects**, add **Instruct
 subjects; the dashboard shows the temporary sign-in to pass on). Then run the acceptance test in
 section 9.
 
+### 4.5 Accounts and credentials
+
+- **No credentials ship with the code.** The admin account is created the first time the server
+  starts with an empty database, from the stack parameters `AdminEmail` (the sign-in name) and
+  `AdminInitialPassword`.
+- The initial password is **temporary**: the first sign-in forces a new one. Choose a throw-away
+  value — AWS users who can read the instance's user data (or `deploy/.env` on the server) can see
+  it; it is useless after the first sign-in. Changing `ADMIN_PASSWORD` later has no effect.
+- Passwords are stored only as scrypt hashes; nobody can read one back. Forgotten admin password:
+  `sudo bash reset-password.sh <admin email>` on the server prints a new temporary one.
+- There is exactly **one admin**; the dashboard has no way to create a second.
+- **Instructors** are created by the admin (Instructors → Add instructor). The dashboard shows the
+  temporary password once, to pass on; the instructor must replace it at first sign-in. The admin
+  can set a new temporary password or switch an account off (which signs it out immediately).
+- Sign-in protection: 8 wrong attempts block that email + IP for 15 minutes; a password change
+  signs the account out everywhere else; sessions last 14 days of inactivity.
+- Other secrets: the YouTube client secret and refresh token are entered/created in the dashboard
+  and live in the database (see *Security model*). AWS access uses IAM roles — there are no AWS keys.
+
 ## 5. Configuration reference
 
 On the server: `/opt/lecture-recorder/deploy/.env` (written by the template; see
