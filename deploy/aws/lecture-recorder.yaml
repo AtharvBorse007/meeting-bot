@@ -112,7 +112,7 @@ Parameters:
     Description: Optional. Name of an existing EC2 key pair, only needed for SSH.
   RepoUrl:
     Type: String
-    Default: https://github.com/omkar-kokane/meeting-bot.git
+    Default: https://github.com/AtharvBorse007/meeting-bot.git
     Description: Git repository with the Lecture Recorder code (for a private repository include a read-only token in the URL).
   RepoBranch:
     Type: String

@@ -1,0 +1,85 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StackServicesInMumbai",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:*",
+        "ec2:*",
+        "ecs:*",
+        "ecr:*",
+        "s3:*",
+        "logs:*",
+        "sns:*",
+        "cloudwatch:*",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:StartSession",
+        "ssm:ResumeSession",
+        "ssm:TerminateSession",
+        "ssm:DescribeSessions",
+        "ssm:DescribeInstanceInformation",
+        "ssm:GetConnectionStatus",
+        "cloudshell:*"
+      ],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "ap-south-1" } }
+    },
+    {
+      "Sid": "StackRolesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:PassRole",
+        "iam:PutRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/lecture-recorder-*",
+        "arn:aws:iam::*:instance-profile/lecture-recorder-*"
+      ]
+    },
+    {
+      "Sid": "ServiceLinkedRoles",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": ["ecs.amazonaws.com", "events.amazonaws.com"]
+        }
+      }
+    },
+    {
+      "Sid": "BudgetAlert",
+      "Effect": "Allow",
+      "Action": [
+        "budgets:ViewBudget",
+        "budgets:ModifyBudget",
+        "budgets:DescribeBudgets"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

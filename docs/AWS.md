@@ -70,6 +70,27 @@ start) and admit it when it asks to join.
 - An AWS account in the region you want (Mumbai: `ap-south-1`).
 - The ability to add a DNS record for your domain.
 - **Commit and push the code** — the server downloads it from the repository.
+- An **IAM user** to deploy with: IAM → Users → Create user (`meeting-bot-deployer`, console
+  access) → attach `deploy/aws/iam-policy-stackdeploy.json` as a policy. Its IAM rights only cover
+  roles named `lecture-recorder-*`, so **name the stack exactly `lecture-recorder`**. Detach the
+  policy after deploying; the running app does not use it.
+- New accounts can have a low **Fargate vCPU quota** (Service Quotas → AWS Fargate); the template
+  allows 10 lectures at once, which needs 10.
+
+### Free-tier accounts: one EC2 server instead
+
+Fargate is not covered by the AWS Free plan. Attach `deploy/aws/iam-policy-singlevm.json` to the
+deploying user instead, open **CloudShell** in `ap-south-1`, and run:
+
+```bash
+git clone --depth 1 https://github.com/AtharvBorse007/meeting-bot.git && cd meeting-bot
+ADMIN_EMAIL=you@deboistech.in bash deploy/aws/launch-single-vm.sh
+```
+
+It creates a budget alert (gross cost, so credit-paid usage counts), an Elastic IP, a security
+group and an `m7i-flex.large` server (free-plan eligible, 2 vCPU / 8 GB) on `<ip>.sslip.io`,
+then prints the follow-up commands (lower `MAX_CONCURRENT_BOTS` to 2, add the daily backup).
+The Free plan closes the account after 6 months: upgrade or move before then.
 
 ## 2. Create the stack
 
@@ -95,7 +116,8 @@ Tick *I acknowledge that AWS CloudFormation might create IAM resources* and crea
 aws cloudformation deploy --region ap-south-1 --stack-name lecture-recorder \
   --template-file deploy/aws/lecture-recorder.yaml --capabilities CAPABILITY_IAM \
   --parameter-overrides DomainName=recorder.deboistech.in AdminEmail=you@deboistech.in \
-    AdminInitialPassword='Temp-Pass-123' AlertEmail=you@deboistech.in
+    AdminInitialPassword='Temp-Pass-123' AlertEmail=you@deboistech.in \
+    RepoUrl=https://github.com/AtharvBorse007/meeting-bot.git
 aws cloudformation describe-stacks --region ap-south-1 --stack-name lecture-recorder --query 'Stacks[0].Outputs'
 ```
 

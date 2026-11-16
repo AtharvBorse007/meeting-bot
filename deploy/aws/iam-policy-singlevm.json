@@ -1,0 +1,45 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Ec2InMumbai",
+      "Effect": "Allow",
+      "Action": "ec2:*",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "ap-south-1" } }
+    },
+    {
+      "Sid": "BrowserTerminal",
+      "Effect": "Allow",
+      "Action": [
+        "ec2-instance-connect:SendSSHPublicKey",
+        "ec2-instance-connect:OpenTunnel",
+        "cloudshell:*"
+      ],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "ap-south-1" } }
+    },
+    {
+      "Sid": "UbuntuAmiLookup",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:ap-south-1::parameter/aws/service/canonical/*"
+    },
+    {
+      "Sid": "BudgetAlert",
+      "Effect": "Allow",
+      "Action": [
+        "budgets:ViewBudget",
+        "budgets:ModifyBudget",
+        "budgets:DescribeBudgets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SeeCredits",
+      "Effect": "Allow",
+      "Action": ["aws-portal:ViewBilling", "billing:Get*", "billing:List*", "ce:Get*", "ce:Describe*"],
+      "Resource": "*"
+    }
+  ]
+}

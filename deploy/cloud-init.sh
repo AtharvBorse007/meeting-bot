@@ -15,7 +15,7 @@
 # ======================= fill in =======================
 DOMAIN="recorder.example.com"          # without https://; its DNS A record must point at this VM
 ADMIN_EMAIL="admin@example.com"
-REPO_URL="https://github.com/omkar-kokane/meeting-bot.git"
+REPO_URL="https://github.com/AtharvBorse007/meeting-bot.git"
 REPO_BRANCH="main"
 # Optional, can be added later in /opt/lecture-recorder/deploy/.env
 YOUTUBE_CLIENT_ID=""

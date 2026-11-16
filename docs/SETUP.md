@@ -44,7 +44,7 @@ ssh ubuntu@<server-ip>
 On the server:
 
 ```bash
-git clone https://github.com/omkar-kokane/meeting-bot.git
+git clone https://github.com/AtharvBorse007/meeting-bot.git
 cd meeting-bot/deploy
 bash install.sh
 ```
