@@ -13,7 +13,7 @@ Metadata:
       - Label: { default: Recorders }
         Parameters: [RecorderSize, UseSpot, MaxLecturesAtOnce]
       - Label: { default: Server and storage }
-        Parameters: [DashboardInstanceType, DashboardDiskGb, DeepArchiveDays]
+        Parameters: [DashboardInstanceType, DashboardDiskGb, DeepArchiveDays, AutoRecover]
       - Label: { default: Alerts and costs }
         Parameters: [AlertEmail, MonthlyBudgetUsd]
       - Label: { default: Access (optional) }
@@ -110,6 +110,14 @@ Parameters:
     Type: String
     Default: ''
     Description: Optional. Name of an existing EC2 key pair, only needed for SSH.
+  AutoRecover:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Recover or reboot the dashboard server automatically when its status checks fail. Needs the
+      AWSServiceRoleForCloudWatchEvents service-linked role (created on first use, which needs
+      iam:CreateServiceLinkedRole). With false the alarms only email AlertEmail.
   RepoUrl:
     Type: String
     Default: https://github.com/AtharvBorse007/meeting-bot.git
@@ -133,6 +141,7 @@ Conditions:
   HasDomain: !Not [!Equals [!Ref DomainName, '']]
   HasSsh: !Not [!Equals [!Ref SshAllowedCidr, '']]
   HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  UseAutoRecover: !Equals [!Ref AutoRecover, 'true']
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
 
 Resources:
@@ -457,7 +466,7 @@ Resources:
       InstanceType: !Ref DashboardInstanceType
       ImageId: !Ref UbuntuAmiArm64
       IamInstanceProfile: !Ref DashboardInstanceProfile
-      SubnetId: !Ref PublicSubnetA
+      SubnetId: !Ref PublicSubnetB   # ap-south-1a had no t4g capacity in Nov 2026
       SecurityGroupIds: [!GetAtt DashboardSecurityGroup.GroupId]
       KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref AWS::NoValue]
       BlockDeviceMappings:
@@ -560,7 +569,7 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
-        - !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover'
+        - !If [UseAutoRecover, !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover', !Ref AWS::NoValue]
         - !If [HasAlertEmail, !Ref AlertTopic, !Ref AWS::NoValue]
 
   # The operating system stopped responding: reboot it (recorders keep recording meanwhile)
@@ -577,7 +586,7 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
-        - !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:reboot'
+        - !If [UseAutoRecover, !Sub 'arn:${AWS::Partition}:automate:${AWS::Region}:ec2:reboot', !Ref AWS::NoValue]
         - !If [HasAlertEmail, !Ref AlertTopic, !Ref AWS::NoValue]
 
   MonthlyBudget:
